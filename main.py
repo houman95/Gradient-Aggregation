@@ -7,40 +7,54 @@ from torchvision import datasets, models, transforms
 from torch.utils.data import DataLoader, Subset
 import pickle
 
-class LeNet(nn.Module):
-    def __init__(self):
-        super(LeNet, self).__init__()
-        self.conv1 = nn.Conv2d(1, 6, 5)  # MNIST images are grayscale, so 1 input channel
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 4 * 4, 120)  # Adjusted for MNIST image size
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)  # 10 output classes (digits 0-9)
 
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 4 * 4)  # Flatten the tensor for the fully connected layer
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+class Client:
+    def __init__(self, train_loader, criterion, num_epochs):
+        self.train_loader = train_loader
+        self.criterion = criterion
+        self.num_epochs = num_epochs
+    def train(self, global_model):
+        # Create a local copy of the global model for training
+        local_model = copy.deepcopy(global_model)
+        optimizer = optim.SGD(local_model.parameters(), lr=0.001, momentum=0.9)
 
+        # Train the local model
+        trained_model, model_difference, _, _ = train_model(local_model, self.criterion, optimizer, self.train_loader, self.num_epochs)
+        return model_difference
 
-def load_mnist(root='./data',
-               transform=transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])):
-    train_dataset = datasets.MNIST(root=root, train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(root=root, train=False, download=True, transform=transform)
+def average_model_differences(model_differences):
+    avg_difference = {}
+    for key in model_differences[0].keys():
+        avg_difference[key] = sum(model_difference[key] for model_difference in model_differences) / len(
+            model_differences)
+    return avg_difference
+def federated_learning(clients, global_model, num_rounds, test_loader):
+    all_rounds_info = []
 
-    return train_dataset, test_dataset
+    for round in range(num_rounds):
+        model_differences = []
 
+        # Each client trains and sends model difference
+        for client in clients:
+            model_difference = client.train(global_model)
+            model_differences.append(model_difference)
 
+        # Average the model differences
+        averaged_difference = average_model_differences(model_differences)
+
+        # Reconstruct the global model
+        global_model = reconstruct_model(global_model, averaged_difference)
+
+        # Evaluate global model accuracy
+        global_accuracy = evaluate_accuracy(global_model, test_loader)
+        all_rounds_info.append(global_accuracy)
+        print(f"Round {round + 1}/{num_rounds}, Global Model Accuracy: {global_accuracy:.2f}%")
+
+    return all_rounds_info
 
 def train_model(model, criterion, optimizer, train_loader, num_epochs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    epoch_losses = []
-    epoch_accuracy = []
+    model = model.to(device)
     # Store the complete pre-training state of the model
     pre_training_state = copy.deepcopy(model.state_dict())
     epoch_losses = []
@@ -142,57 +156,38 @@ def evaluate_accuracy(model, data_loader):
 
 def main():
     try:
-        #initialize records
-        # Initialize records
-        all_rounds_info = []
-        # Number of training rounds and epochs
-        num_epochs = 5
-        num_rounds = 10
-        # Step 1: Load and Prepare the CIFAR10 Dataset
+        num_epochs = 3
+        num_rounds = 4
+        num_clients = 2
+        fraction_of_dataset = 0.02  # 2% of the dataset for each client
+
+        # Load and prepare CIFAR10 dataset
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
-        train_set, test_set = load_cifar10(root='./data', transform=transform)
+        train_set, test_set = load_cifar10(root='./data', fraction=fraction_of_dataset, transform=transform)
+        test_loader = DataLoader(test_set, batch_size=64, shuffle=False, num_workers=2)
 
-        indices = torch.randperm(len(train_set)).tolist()
-        train_set_reduced = Subset(train_set, indices[:int(0.1 * len(indices))])
-
-        train_loader = DataLoader(train_set_reduced, batch_size=64, shuffle=True, num_workers=2)
-
-        # Step 2: Define the ResNet18 Model or LeNet
-        model = models.resnet18(pretrained=False)
-        model.fc = nn.Linear(model.fc.in_features, 10)  # CIFAR10 has 10 classes
-        model_copy = copy.deepcopy(model)
-
-        # Step 3: Training Loop
+        # Initialize clients and global model
+        clients = []
+        global_model = models.resnet18(pretrained=False)
+        global_model.fc = nn.Linear(global_model.fc.in_features, 10)
+        # Training Loop
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+        optimizer = optim.SGD(global_model.parameters(), lr=0.001, momentum=0.9)
 
-        for round in range(num_rounds):
-            print(f"Starting training round {round + 1}/{num_rounds}")
-            round_info = {'epoch_losses': [], 'epoch_accuracies': [], 'trained_accuracy': None, 'reconstructed_accuracy': None}
-            trained_model, model_difference, epoch_losses, epoch_accuracies = train_model(model, criterion, optimizer, train_loader, num_epochs)
-            round_info['epoch_losses'] = epoch_losses
-            round_info['epoch_accuracies'] = epoch_accuracies
+        for i in range(num_clients):
+            client_train_set = Subset(train_set, torch.randperm(len(train_set)).tolist()[:int(fraction_of_dataset * len(train_set))])
+            client_train_loader = DataLoader(client_train_set, batch_size=64, shuffle=True, num_workers=2)
+            client = Client(client_train_loader, criterion, num_epochs)
+            clients.append(client)
+        # Perform federated learning
+        all_rounds_info = federated_learning(clients, global_model, num_rounds, test_loader)
 
-            # Reconstruct the Model
-            reconstructed_model = reconstruct_model(model_copy, model_difference)
-
-            # Evaluate accuracies
-            test_loader = DataLoader(test_set, batch_size=64, shuffle=False, num_workers=2)
-            trained_model_accuracy = evaluate_accuracy(trained_model, test_loader)
-            reconstructed_model_accuracy = evaluate_accuracy(reconstructed_model, test_loader)
-            round_info['trained_accuracy'] = trained_model_accuracy
-            round_info['reconstructed_accuracy'] = reconstructed_model_accuracy
-
-            all_rounds_info.append(round_info)
-
-            print(f"Accuracy of Trained Model after round {round + 1}: {trained_model_accuracy:.2f}%")
-            print(f"Accuracy of Reconstructed Model after round {round + 1}: {reconstructed_model_accuracy:.2f}%")
-
-            # Reinitialize the model and optimizer if needed
-            model_copy = copy.deepcopy(model)
+        # Save the results
+        with open('all_rounds_info.pkl', 'wb') as file:
+            pickle.dump(all_rounds_info, file)
     except Exception as e:
         print(f"An error occured:{e}")
         traceback.print_exc()
