@@ -38,21 +38,38 @@ def load_mnist(root='./data',
 def train_model(model, criterion, optimizer, train_loader, num_epochs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-
+    epoch_losses = []
+    epoch_accuracy = []
     # Store the complete pre-training state of the model
     pre_training_state = copy.deepcopy(model.state_dict())
+    epoch_losses = []
+    epoch_accuracies = []
 
     # Training Loop
 
     for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-            model.train()
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+        # Calculate average loss and accuracy for the epoch
+        epoch_loss = running_loss / len(train_loader)
+        epoch_accuracy = 100 * correct / total
+
+        epoch_losses.append(epoch_loss)
+        epoch_accuracies.append(epoch_accuracy)
 
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
 
@@ -66,7 +83,7 @@ def train_model(model, criterion, optimizer, train_loader, num_epochs):
             model_difference[f"{name}.running_mean"] = model.state_dict()[f"{name}.running_mean"].clone()
             model_difference[f"{name}.running_var"] = model.state_dict()[f"{name}.running_var"].clone()
 
-    return model, model_difference
+    return model, model_difference, epoch_losses, epoch_accuracies
 
 
 def reconstruct_model(original_model, model_difference):
@@ -124,7 +141,12 @@ def evaluate_accuracy(model, data_loader):
 
 def main():
     try:
+        #initialize records
+        # Initialize records
+        all_rounds_info = []
+        # Number of training rounds and epochs
         num_epochs = 5
+        num_rounds = 10
         # Step 1: Load and Prepare the CIFAR10 Dataset
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -146,23 +168,33 @@ def main():
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
 
-        trained_model, model_difference = train_model(model, criterion, optimizer, train_loader, num_epochs)
+        for round in range(num_rounds):
+            print(f"Starting training round {round + 1}/{num_rounds}")
+            round_info = {'epoch_losses': [], 'epoch_accuracies': [], 'trained_accuracy': None, 'reconstructed_accuracy': None}
+            trained_model, model_difference, epoch_losses, epoch_accuracies = train_model(model, criterion, optimizer, train_loader, num_epochs)
+            round_info['epoch_losses'] = epoch_losses
+            round_info['epoch_accuracies'] = epoch_accuracies
 
-        # Step 5: Reconstruct the Model
-        reconstructed_model = reconstruct_model(model_copy, model_difference)
+            # Reconstruct the Model
+            reconstructed_model = reconstruct_model(model_copy, model_difference)
 
-        # Step 6: Evaluate the Model
-        test_loader = DataLoader(test_set, batch_size=64, shuffle=False, num_workers=2)
+            # Evaluate accuracies
+            test_loader = DataLoader(test_set, batch_size=64, shuffle=False, num_workers=2)
+            trained_model_accuracy = evaluate_accuracy(trained_model, test_loader)
+            reconstructed_model_accuracy = evaluate_accuracy(reconstructed_model, test_loader)
+            round_info['trained_accuracy'] = trained_model_accuracy
+            round_info['reconstructed_accuracy'] = reconstructed_model_accuracy
 
-        trained_model_accuracy = evaluate_accuracy(trained_model, test_loader)
-        reconstructed_model_accuracy = evaluate_accuracy(reconstructed_model, test_loader)
+            all_rounds_info.append(round_info)
 
-        print(f"Accuracy of Trained Model: {trained_model_accuracy:.2f}%")
-        print(f"Accuracy of Reconstructed Model: {reconstructed_model_accuracy:.2f}%")
+            print(f"Accuracy of Trained Model after round {round + 1}: {trained_model_accuracy:.2f}%")
+            print(f"Accuracy of Reconstructed Model after round {round + 1}: {reconstructed_model_accuracy:.2f}%")
 
+            # Reinitialize the model and optimizer if needed
+            model_copy = copy.deepcopy(model)
     except Exception as e:
         print(f"An error occured:{e}")
         traceback.print_exc()
-
+    return all_rounds_info
 if __name__ == "__main__":
     main()
