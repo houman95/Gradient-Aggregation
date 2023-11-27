@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, models, transforms
 from torch.utils.data import DataLoader, Subset
+import pickle
 
 class LeNet(nn.Module):
     def __init__(self):
@@ -197,4 +198,6 @@ def main():
         traceback.print_exc()
     return all_rounds_info
 if __name__ == "__main__":
-    main()
+    all_rounds_info = main()
+    with open('all_rounds_info.pkl', 'wb') as file:
+        pickle.dump(all_rounds_info, file)
