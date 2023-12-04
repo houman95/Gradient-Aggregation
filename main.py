@@ -14,8 +14,13 @@ class Client:
         self.criterion = criterion
         self.num_epochs = num_epochs
     def train(self, global_model):
+
         # Create a local copy of the global model for training
         local_model = copy.deepcopy(global_model)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        local_model.to(device)
+        print("Model device:", next(local_model.parameters()).device)
+
         optimizer = optim.SGD(local_model.parameters(), lr=0.001, momentum=0.9)
 
         # Train the local model
@@ -54,7 +59,9 @@ def federated_learning(clients, global_model, num_rounds, test_loader):
 
 def train_model(model, criterion, optimizer, train_loader, num_epochs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("CUDA Available:", torch.cuda.is_available())
     model = model.to(device)
+
     # Store the complete pre-training state of the model
     pre_training_state = copy.deepcopy(model.state_dict())
     epoch_losses = []
@@ -104,21 +111,28 @@ def train_model(model, criterion, optimizer, train_loader, num_epochs):
 def reconstruct_model(original_model, model_difference):
     # Create a copy of the original model to keep it unchanged
     reconstructed_model = copy.deepcopy(original_model)
+    device = next(reconstructed_model.parameters()).device  # Get the device from the model
 
     # Apply the differences to the reconstructed model's parameters
     with torch.no_grad():  # Ensure no gradient computation is done here
         for name, param in reconstructed_model.named_parameters():
             if name in model_difference:
+                # Move model_difference to the correct device
+                diff = model_difference[name].to(device)
                 # Update the parameter with the difference
-                param.data.add_(model_difference[name])
+                param.data.add_(diff)
 
         # Update the running mean and variance for BatchNorm layers
         for name, module in reconstructed_model.named_modules():
             if isinstance(module, nn.BatchNorm2d):
+
                 if f"{name}.running_mean" in model_difference:
                     module.running_mean.copy_(model_difference[f"{name}.running_mean"])
+                    running_mean_diff = model_difference[f"{name}.running_mean"].to(device)
+
                 if f"{name}.running_var" in model_difference:
-                    module.running_var.copy_(model_difference[f"{name}.running_var"])
+                    running_var_diff = model_difference[f"{name}.running_var"].to(device)
+                    module.running_var.copy_(running_var_diff)
 
     return reconstructed_model
 def load_cifar10(root='./data', fraction=0.02, transform=transforms.Compose([
@@ -157,9 +171,9 @@ def evaluate_accuracy(model, data_loader):
 def main():
     try:
         num_epochs = 3
-        num_rounds = 4
-        num_clients = 2
-        fraction_of_dataset = 0.02  # 2% of the dataset for each client
+        num_rounds = 10
+        num_clients = 1
+        fraction_of_dataset = 0.2  # 20% of the dataset for each client
 
         # Load and prepare CIFAR10 dataset
         transform = transforms.Compose([
