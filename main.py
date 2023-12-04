@@ -135,7 +135,7 @@ def reconstruct_model(original_model, model_difference):
                     module.running_var.copy_(running_var_diff)
 
     return reconstructed_model
-def load_cifar10(root='./data', fraction=0.02, transform=transforms.Compose([
+def load_cifar10(root='./data', fraction=1, transform=transforms.Compose([
                     transforms.ToTensor(),
                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])):
     train_dataset = datasets.CIFAR10(root=root, train=True, download=True, transform=transform)
@@ -173,7 +173,7 @@ def main():
         num_epochs = 3
         num_rounds = 10
         num_clients = 1
-        fraction_of_dataset = 0.2  # 20% of the dataset for each client
+        fraction_of_dataset = 1  # 20% of the dataset for each client
 
         # Load and prepare CIFAR10 dataset
         transform = transforms.Compose([
@@ -191,11 +191,22 @@ def main():
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(global_model.parameters(), lr=0.001, momentum=0.9)
 
+        # Calculate the size of each subset
+        subset_size = len(train_set) // num_clients
+
         for i in range(num_clients):
-            client_train_set = Subset(train_set, torch.randperm(len(train_set)).tolist()[:int(fraction_of_dataset * len(train_set))])
+            # Calculate start and end indices for each subset
+            start_idx = i * subset_size
+            end_idx = start_idx + subset_size if i != num_clients - 1 else len(train_set)
+
+            # Create a subset for each client
+            client_train_set = Subset(train_set, list(range(start_idx, end_idx)))
             client_train_loader = DataLoader(client_train_set, batch_size=64, shuffle=True, num_workers=2)
+
+            # Create a client with the subset
             client = Client(client_train_loader, criterion, num_epochs)
             clients.append(client)
+
         # Perform federated learning
         all_rounds_info = federated_learning(clients, global_model, num_rounds, test_loader)
 
