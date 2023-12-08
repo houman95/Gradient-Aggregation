@@ -1,20 +1,124 @@
 import traceback
 import copy
+import multiprocessing as mp
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, models, transforms
-from torch.utils.data import DataLoader, Subset
+import torchvision
+from torchvision import models, datasets, transforms
+from torch.utils.data import DataLoader, Subset, random_split
+from multiprocessing import Pool
+from functools import partial
 import pickle
+# Update the dataset loading
+def load_cifar10_splits(num_splits, root='./data', fraction=0.5):
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
 
+    train_dataset = torchvision.datasets.CIFAR10(root, train=True, download=True, transform=transform_train)
+    train_dataset, _ = random_split(train_dataset, [int(fraction * len(train_dataset)),
+                                                    len(train_dataset) - int(fraction * len(train_dataset))])
 
+    test_dataset = torchvision.datasets.CIFAR10(root, train=False, download=True, transform=transform_test)
+
+    # Split the training dataset
+    train_splits = random_split(train_dataset, [len(train_dataset) // num_splits] * num_splits)
+
+    return train_splits, test_dataset
+# Server Class
+class Server:
+    def __init__(self, clients, global_model, num_rounds, test_loader):
+        self.clients = clients
+        self.global_model = global_model
+        self.num_rounds = num_rounds
+        self.test_loader = test_loader
+
+    def federated_learning(self, num_processes=8):
+        all_rounds_info = {
+            'rounds': [],
+            'global_accuracies': [],
+            'global_losses': [],
+            'global_model_states': []
+        }
+        for round in range(self.num_rounds):
+            #with Pool(processes=num_processes) as pool:
+             #   model_differences = pool.map(partial(train_client, global_model=self.global_model), self.clients)
+
+            model_differences = []
+            for client in self.clients:
+                globalcopy = copy.deepcopy(self.global_model)
+                model_difference = train_client(client, globalcopy)
+                model_differences.append(model_difference)
+
+            # Aggregate and update global model
+            avg_difference = self.average_model_differences(model_differences)
+            self.global_model = self.reconstruct_model(self.global_model, avg_difference)
+            # Evaluate and print global model accuracy
+            global_accuracy,global_loss = evaluate_accuracy(self.global_model, self.test_loader)
+            print(f"Round {round + 1}/{self.num_rounds}, Global Model Accuracy: {global_accuracy:.2f} , global model loss: {global_loss}%")
+            # Save the results
+            all_rounds_info['rounds'].append(round + 1)
+            all_rounds_info['global_accuracies'].append(global_accuracy)
+            all_rounds_info['global_losses'].append(global_loss)
+            all_rounds_info['global_model_states'].append(copy.deepcopy(self.global_model.state_dict()))
+        print(all_rounds_info['global_losses'])
+        return all_rounds_info
+    def average_model_differences(self, model_differences):
+        avg_difference = {}
+        for key in model_differences[0].keys():
+            avg_difference[key] = sum(model_difference[key] for model_difference in model_differences) / len(
+                model_differences)
+        return avg_difference
+    def reconstruct_model(self, original_model, model_difference):
+        # Create a copy of the original model to keep it unchanged
+        reconstructed_model = copy.deepcopy(original_model)
+        device = next(reconstructed_model.parameters()).device  # Get the device from the model
+
+        # Apply the differences to the reconstructed model's parameters
+        with torch.no_grad():  # Ensure no gradient computation is done here
+            for name, param in reconstructed_model.named_parameters():
+                if name in model_difference:
+                    # Move model_difference to the correct device
+                    diff = model_difference[name].to(device)
+                    # Update the parameter with the difference
+                    param.data.add_(diff)
+
+            # Update the running mean and variance for BatchNorm layers
+            for name, module in reconstructed_model.named_modules():
+                if isinstance(module, nn.BatchNorm2d):
+
+                    if f"{name}.running_mean" in model_difference:
+                        module.running_mean.copy_(model_difference[f"{name}.running_mean"])
+                        running_mean_diff = model_difference[f"{name}.running_mean"].to(device)
+                    if f"{name}.running_var" in model_difference:
+                        running_var_diff = model_difference[f"{name}.running_var"].to(device)
+                        module.running_var.copy_(running_var_diff)
+        return reconstructed_model
+def train_client(client, global_model):
+    # Train the client using the global model and return the model difference
+    return client.train(global_model)
+# Client Class
 class Client:
-    def __init__(self, train_loader, criterion, num_epochs):
-        self.train_loader = train_loader
+    def __init__(self, client_id, global_model, train_data, criterion, num_epochs):
+        self.client_id = client_id
+        self.train_data = train_data
         self.criterion = criterion
         self.num_epochs = num_epochs
-    def train(self, global_model):
+        self.global_model = global_model
 
+    # Create the DataLoader for training data
+        self.train_loader = DataLoader(train_data, batch_size=64, shuffle=True, num_workers=0)
+
+    def train(self, global_model):
+        # Load the state dict into the local model
         # Create a local copy of the global model for training
         local_model = copy.deepcopy(global_model)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,40 +128,10 @@ class Client:
         optimizer = optim.SGD(local_model.parameters(), lr=0.001, momentum=0.9)
 
         # Train the local model
-        trained_model, model_difference, _, _ = train_model(local_model, self.criterion, optimizer, self.train_loader, self.num_epochs)
+        trained_model, model_difference, _, _ = train_model(self.client_id, local_model, self.criterion, optimizer, self.train_loader,
+                                                                self.num_epochs)
         return model_difference
-
-def average_model_differences(model_differences):
-    avg_difference = {}
-    for key in model_differences[0].keys():
-        avg_difference[key] = sum(model_difference[key] for model_difference in model_differences) / len(
-            model_differences)
-    return avg_difference
-def federated_learning(clients, global_model, num_rounds, test_loader):
-    all_rounds_info = []
-
-    for round in range(num_rounds):
-        model_differences = []
-
-        # Each client trains and sends model difference
-        for client in clients:
-            model_difference = client.train(global_model)
-            model_differences.append(model_difference)
-
-        # Average the model differences
-        averaged_difference = average_model_differences(model_differences)
-
-        # Reconstruct the global model
-        global_model = reconstruct_model(global_model, averaged_difference)
-
-        # Evaluate global model accuracy
-        global_accuracy = evaluate_accuracy(global_model, test_loader)
-        all_rounds_info.append(global_accuracy)
-        print(f"Round {round + 1}/{num_rounds}, Global Model Accuracy: {global_accuracy:.2f}%")
-
-    return all_rounds_info
-
-def train_model(model, criterion, optimizer, train_loader, num_epochs):
+def train_model(clientid, model, criterion, optimizer, train_loader, num_epochs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("CUDA Available:", torch.cuda.is_available())
     model = model.to(device)
@@ -89,11 +163,10 @@ def train_model(model, criterion, optimizer, train_loader, num_epochs):
         # Calculate average loss and accuracy for the epoch
         epoch_loss = running_loss / len(train_loader)
         epoch_accuracy = 100 * correct / total
-
         epoch_losses.append(epoch_loss)
         epoch_accuracies.append(epoch_accuracy)
 
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
+        print(f"client {clientid}, Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
 
     # Calculate the parameter differences post-training
     model_difference = {name: model.state_dict()[name] - pre_training_state[name]
@@ -104,72 +177,38 @@ def train_model(model, criterion, optimizer, train_loader, num_epochs):
         if isinstance(module, nn.BatchNorm2d):
             model_difference[f"{name}.running_mean"] = model.state_dict()[f"{name}.running_mean"].clone()
             model_difference[f"{name}.running_var"] = model.state_dict()[f"{name}.running_var"].clone()
-
     return model, model_difference, epoch_losses, epoch_accuracies
 
 
-def reconstruct_model(original_model, model_difference):
-    # Create a copy of the original model to keep it unchanged
-    reconstructed_model = copy.deepcopy(original_model)
-    device = next(reconstructed_model.parameters()).device  # Get the device from the model
 
-    # Apply the differences to the reconstructed model's parameters
-    with torch.no_grad():  # Ensure no gradient computation is done here
-        for name, param in reconstructed_model.named_parameters():
-            if name in model_difference:
-                # Move model_difference to the correct device
-                diff = model_difference[name].to(device)
-                # Update the parameter with the difference
-                param.data.add_(diff)
-
-        # Update the running mean and variance for BatchNorm layers
-        for name, module in reconstructed_model.named_modules():
-            if isinstance(module, nn.BatchNorm2d):
-
-                if f"{name}.running_mean" in model_difference:
-                    module.running_mean.copy_(model_difference[f"{name}.running_mean"])
-                    running_mean_diff = model_difference[f"{name}.running_mean"].to(device)
-
-                if f"{name}.running_var" in model_difference:
-                    running_var_diff = model_difference[f"{name}.running_var"].to(device)
-                    module.running_var.copy_(running_var_diff)
-
-    return reconstructed_model
-def load_cifar10(root='./data', fraction=1, transform=transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])):
-    train_dataset = datasets.CIFAR10(root=root, train=True, download=True, transform=transform)
-    test_dataset = datasets.CIFAR10(root=root, train=False, download=True, transform=transform)
-
-    # Reduce dataset size
-    indices = torch.randperm(len(train_dataset)).tolist()
-    reduced_size = int(fraction * len(indices))
-    train_dataset_reduced = Subset(train_dataset, indices[:reduced_size])
-
-    return train_dataset_reduced, test_dataset
-
-
-
-# Function to evaluate the accuracy of a model
+#Function to evaluate the accuracy of a model
 def evaluate_accuracy(model, data_loader):
+    device = next(model.parameters()).device  # Get the device model is on
     model.eval()  # Set the model to evaluation mode
     correct = 0
     total = 0
-
+    total_loss = 0
+    criterion = nn.CrossEntropyLoss()
     with torch.no_grad():  # Disable gradient calculation for efficiency
         for images, labels in data_loader:
+            images, labels = images.to(device), labels.to(device)  # Move data to the same device as the model
             outputs = model(images)
+            loss = criterion(outputs,labels)
+            total_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
     accuracy = 100 * correct / total
-    return accuracy
+    avg_loss = total_loss / len(data_loader)
+    return accuracy, avg_loss
 
 
 
 def main():
     try:
+        #mp.set_start_method('spawn') commented
+        #DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         num_epochs = 3
         num_rounds = 10
         num_clients = 1
@@ -180,44 +219,34 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
-        train_set, test_set = load_cifar10(root='./data', fraction=fraction_of_dataset, transform=transform)
-        test_loader = DataLoader(test_set, batch_size=64, shuffle=False, num_workers=2)
+        train_splits, test_dataset = load_cifar10_splits(num_clients)
+        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=2)
 
         # Initialize clients and global model
         clients = []
         global_model = models.resnet18(pretrained=False)
         global_model.fc = nn.Linear(global_model.fc.in_features, 10)
+        global_model = global_model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         # Training Loop
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(global_model.parameters(), lr=0.001, momentum=0.9)
-
-        # Calculate the size of each subset
-        subset_size = len(train_set) // num_clients
-
-        for i in range(num_clients):
-            # Calculate start and end indices for each subset
-            start_idx = i * subset_size
-            end_idx = start_idx + subset_size if i != num_clients - 1 else len(train_set)
-
-            # Create a subset for each client
-            client_train_set = Subset(train_set, list(range(start_idx, end_idx)))
-            client_train_loader = DataLoader(client_train_set, batch_size=64, shuffle=True, num_workers=2)
-
-            # Create a client with the subset
-            client = Client(client_train_loader, criterion, num_epochs)
-            clients.append(client)
+        # Load the CIFAR10 dataset and split it into training subsets for each client
+        train_splits, test_dataset = load_cifar10_splits(num_clients)
+        # Create Client objects, each with its own subset of the training data
+        clients = [Client(i, global_model, train_splits[i], criterion, num_epochs) for i in range(num_clients)]
 
         # Perform federated learning
-        all_rounds_info = federated_learning(clients, global_model, num_rounds, test_loader)
+        server = Server(clients, global_model, num_rounds, test_loader)
+        all_rounds_info = server.federated_learning()
 
         # Save the results
         with open('all_rounds_info.pkl', 'wb') as file:
             pickle.dump(all_rounds_info, file)
+
+
     except Exception as e:
         print(f"An error occured:{e}")
         traceback.print_exc()
-    return all_rounds_info
+
 if __name__ == "__main__":
-    all_rounds_info = main()
-    with open('all_rounds_info.pkl', 'wb') as file:
-        pickle.dump(all_rounds_info, file)
+    main()
