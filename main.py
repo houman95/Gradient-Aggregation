@@ -10,6 +10,30 @@ from torch.utils.data import DataLoader, Subset, random_split
 from multiprocessing import Pool
 from functools import partial
 import pickle
+import random
+import logging
+
+# Configure logging
+logging.basicConfig(filename='federated_learning.log', level=logging.INFO, filemode='w',
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def load_last_round_model_params(file_name):
+    with open(file_name, 'rb') as file:
+        all_rounds_info = pickle.load(file)
+    last_round_params = all_rounds_info['global_model_states'][-1]
+    return last_round_params
+
+
+def decide_transmission(num_clients):
+    return [random.random() < 1.0 / num_clients for _ in range(num_clients)]
+
+
+def initialize_global_model(model, model_params):
+    model.load_state_dict(model_params)
+    return model
+
+
 # Update the dataset loading
 def load_cifar10_splits(num_splits, root='./data', fraction=0.5):
     transform_train = transforms.Compose([
@@ -33,13 +57,16 @@ def load_cifar10_splits(num_splits, root='./data', fraction=0.5):
     train_splits = random_split(train_dataset, [len(train_dataset) // num_splits] * num_splits)
 
     return train_splits, test_dataset
+
+
 # Server Class
 class Server:
-    def __init__(self, clients, global_model, num_rounds, test_loader):
+    def __init__(self, clients, global_model, num_rounds, test_loader, framelength):
         self.clients = clients
         self.global_model = global_model
         self.num_rounds = num_rounds
         self.test_loader = test_loader
+        self.framelength = framelength
 
     def federated_learning(self, num_processes=8):
         all_rounds_info = {
@@ -49,21 +76,38 @@ class Server:
             'global_model_states': []
         }
         for round in range(self.num_rounds):
-            #with Pool(processes=num_processes) as pool:
-             #   model_differences = pool.map(partial(train_client, global_model=self.global_model), self.clients)
+            successful_clients = set()
+            # Framed Slotted ALOHA mechanism
+            for slot in range(self.framelength):
+                transmission_decisions = decide_transmission(len(self.clients))
+                if transmission_decisions.count(True) == 1:  # Only one client transmitted successfully
+                    successful_client_index = transmission_decisions.index(True)
+                    successful_clients.add(successful_client_index)
+            # Handle no successful transmission
+            if not successful_clients:
+                logging.info(
+                    f"No successful transmission in round {round + 1}. Training all clients without updating the server model.")
+                for client in self.clients:
+                    globalcopy = copy.deepcopy(self.global_model)
+                    _ = train_client(client)  # Train client but do not collect model difference
+                continue  # Skip model update and proceed to the next round
 
             model_differences = []
-            for client in self.clients:
+            for client_index in successful_clients:
                 globalcopy = copy.deepcopy(self.global_model)
-                model_difference = train_client(client, globalcopy)
+                model_difference = train_client(self.clients[client_index])
                 model_differences.append(model_difference)
 
             # Aggregate and update global model
             avg_difference = self.average_model_differences(model_differences)
             self.global_model = self.reconstruct_model(self.global_model, avg_difference)
+            for client in self.clients:
+                globalcopy = copy.deepcopy(self.global_model)
+                client.local_model = globalcopy
             # Evaluate and print global model accuracy
-            global_accuracy,global_loss = evaluate_accuracy(self.global_model, self.test_loader)
-            print(f"Round {round + 1}/{self.num_rounds}, Global Model Accuracy: {global_accuracy:.2f} , global model loss: {global_loss}%")
+            global_accuracy, global_loss = evaluate_accuracy(self.global_model, self.test_loader)
+            logging.info(
+                f"Round {round + 1}/{self.num_rounds}, Global Model Accuracy: {global_accuracy:.2f} , global model loss: {global_loss}%")
             # Save the results
             all_rounds_info['rounds'].append(round + 1)
             all_rounds_info['global_accuracies'].append(global_accuracy)
@@ -71,12 +115,14 @@ class Server:
             all_rounds_info['global_model_states'].append(copy.deepcopy(self.global_model.state_dict()))
         print(all_rounds_info['global_losses'])
         return all_rounds_info
+
     def average_model_differences(self, model_differences):
         avg_difference = {}
         for key in model_differences[0].keys():
             avg_difference[key] = sum(model_difference[key] for model_difference in model_differences) / len(
                 model_differences)
         return avg_difference
+
     def reconstruct_model(self, original_model, model_difference):
         # Create a copy of the original model to keep it unchanged
         reconstructed_model = copy.deepcopy(original_model)
@@ -102,40 +148,50 @@ class Server:
                         running_var_diff = model_difference[f"{name}.running_var"].to(device)
                         module.running_var.copy_(running_var_diff)
         return reconstructed_model
-def train_client(client, global_model):
+
+
+def train_client(client):
     # Train the client using the global model and return the model difference
-    return client.train(global_model)
+    return client.train()
+
+
 # Client Class
 class Client:
-    def __init__(self, client_id, global_model, train_data, criterion, num_epochs):
+    def __init__(self, client_id, global_model, train_data, test_data, criterion, num_epochs):
         self.client_id = client_id
         self.train_data = train_data
         self.criterion = criterion
         self.num_epochs = num_epochs
-        self.global_model = global_model
-
-    # Create the DataLoader for training data
+        self.local_model = copy.deepcopy(global_model)
+        self.test_loader = test_data
+        # Create the DataLoader for training data
         self.train_loader = DataLoader(train_data, batch_size=64, shuffle=True, num_workers=0)
 
-    def train(self, global_model):
+    def train(self):
         # Load the state dict into the local model
         # Create a local copy of the global model for training
-        local_model = copy.deepcopy(global_model)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        local_model.to(device)
-        print("Model device:", next(local_model.parameters()).device)
+        self.local_model.to(device)
+        #logging.info("Model device:", next(self.local_model.parameters()).device)
 
-        optimizer = optim.SGD(local_model.parameters(), lr=0.001, momentum=0.9)
+        optimizer = optim.SGD(self.local_model.parameters(), lr=0.001, momentum=0.9)
 
         # Train the local model
-        trained_model, model_difference, _, _ = train_model(self.client_id, local_model, self.criterion, optimizer, self.train_loader,
-                                                                self.num_epochs)
-        return model_difference
-def train_model(clientid, model, criterion, optimizer, train_loader, num_epochs):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("CUDA Available:", torch.cuda.is_available())
-    model = model.to(device)
+        self.local_model, model_difference, _, _ = train_model(self.client_id, self.local_model, self.criterion,
+                                                               optimizer, self.train_loader,
+                                                               self.num_epochs, self.test_loader)
 
+        return model_difference
+
+
+def train_model(clientid, model, criterion, optimizer, train_loader, num_epochs,test_loader):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #logging.info("CUDA Available:", torch.cuda.is_available())
+    model = model.to(device)
+    # Evaluate model accuracy before training
+    # Evaluate model accuracy and loss before training
+    pre_training_accuracy, pre_training_loss = evaluate_accuracy(model, test_loader)
+    logging.info(f"Client {clientid}, Pre-training Accuracy: {pre_training_accuracy:.2f}%, Pre-training Loss: {pre_training_loss:.2f}")
     # Store the complete pre-training state of the model
     pre_training_state = copy.deepcopy(model.state_dict())
     epoch_losses = []
@@ -166,7 +222,7 @@ def train_model(clientid, model, criterion, optimizer, train_loader, num_epochs)
         epoch_losses.append(epoch_loss)
         epoch_accuracies.append(epoch_accuracy)
 
-        print(f"client {clientid}, Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
+        logging.info(f"client {clientid}, Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
 
     # Calculate the parameter differences post-training
     model_difference = {name: model.state_dict()[name] - pre_training_state[name]
@@ -180,8 +236,7 @@ def train_model(clientid, model, criterion, optimizer, train_loader, num_epochs)
     return model, model_difference, epoch_losses, epoch_accuracies
 
 
-
-#Function to evaluate the accuracy of a model
+# Function to evaluate the accuracy of a model
 def evaluate_accuracy(model, data_loader):
     device = next(model.parameters()).device  # Get the device model is on
     model.eval()  # Set the model to evaluation mode
@@ -193,7 +248,7 @@ def evaluate_accuracy(model, data_loader):
         for images, labels in data_loader:
             images, labels = images.to(device), labels.to(device)  # Move data to the same device as the model
             outputs = model(images)
-            loss = criterion(outputs,labels)
+            loss = criterion(outputs, labels)
             total_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
@@ -204,14 +259,14 @@ def evaluate_accuracy(model, data_loader):
     return accuracy, avg_loss
 
 
-
 def main():
     try:
-        #mp.set_start_method('spawn') commented
-        #DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # mp.set_start_method('spawn')
+        # DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         num_epochs = 3
-        num_rounds = 10
-        num_clients = 1
+        num_rounds = 100
+        num_clients = 100
+        frame_length = 30
         fraction_of_dataset = 1  # 20% of the dataset for each client
 
         # Load and prepare CIFAR10 dataset
@@ -224,8 +279,11 @@ def main():
 
         # Initialize clients and global model
         clients = []
+        # Load parameters from last round
+        last_round_params = load_last_round_model_params('all_rounds_info100clients3epochfrwd50.pkl')
         global_model = models.resnet18(pretrained=False)
         global_model.fc = nn.Linear(global_model.fc.in_features, 10)
+        global_model = initialize_global_model(global_model, last_round_params)
         global_model = global_model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         # Training Loop
         criterion = nn.CrossEntropyLoss()
@@ -233,20 +291,22 @@ def main():
         # Load the CIFAR10 dataset and split it into training subsets for each client
         train_splits, test_dataset = load_cifar10_splits(num_clients)
         # Create Client objects, each with its own subset of the training data
-        clients = [Client(i, global_model, train_splits[i], criterion, num_epochs) for i in range(num_clients)]
+        clients = [Client(i, global_model, train_splits[i], test_loader, criterion, num_epochs) for i in range(num_clients)]
 
         # Perform federated learning
-        server = Server(clients, global_model, num_rounds, test_loader)
+        server = Server(clients, global_model, num_rounds, test_loader, framelength=frame_length)
         all_rounds_info = server.federated_learning()
+        filename = f'continueall_rounds_info{num_clients}clients{frame_length}framewidth{num_epochs}epoch.pkl'
 
         # Save the results
-        with open('all_rounds_info.pkl', 'wb') as file:
+        with open(filename, 'wb') as file:
             pickle.dump(all_rounds_info, file)
 
 
     except Exception as e:
-        print(f"An error occured:{e}")
+        logging.error(f"An error occured:{e}")
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()
