@@ -1,42 +1,47 @@
 import pickle
 import matplotlib.pyplot as plt
-import torch
-# Load the results
-# Function to load data with mapping to CPU if CUDA is not available
+import os
+import tensorflow as tf
+from tensorflow.python.client import device_lib
+print(device_lib.list_local_devices())
+
 # Function to load data
 def load_data(file_name):
     with open(file_name, 'rb') as file:
         return pickle.load(file)
 
-# Load the results with appropriate device mapping
-all_rounds_info = load_data('all_rounds_info.pkl')
-# Load the results with appropriate device mapping
-all_rounds_info = load_data('all_rounds_info.pkl')
+# List of filenames
+file_names = ["all_rounds_info20clients25framewidth1epoch.pkl",
+              "all_rounds_info20clients20framewidth1epoch.pkl",
+"memory_info20clients15framewidth1epoch.pkl",
+"all_rounds_info20clients10framewidth1epoch.pkl",
+"all_rounds_info20clients5framewidth1epoch.pkl",
+"all_rounds_info20clients2framewidth1epoch.pkl"]
 
-# Extract accuracy and loss from the results
-rounds = all_rounds_info['rounds']
-accuracies = all_rounds_info['global_accuracies']
-losses = all_rounds_info['global_losses']
+# Plotting setup
+plt.figure(figsize=(12, 6))
 
-# Plotting accuracy
-plt.figure(figsize=(10, 5))
-plt.subplot(1, 2, 1)
-plt.plot(rounds, accuracies, marker='o', color='b', label='Accuracy')
+# Loop through each file and plot its data
+for file_name in file_names:
+    all_rounds_info = load_data(file_name)
+
+    # Extract accuracy from the results
+    rounds = all_rounds_info['rounds']
+    accuracies = all_rounds_info['global_accuracies']
+
+    # Extract frame width from file name for the legend
+    frame_width = file_name.split('clients')[1].split('epoch')[0]
+
+    # Plot accuracy
+    plt.plot(rounds, accuracies, marker='o', label=f'Frame Width {frame_width}')
+
+# Finalize plot
 plt.xlabel('Rounds')
 plt.ylabel('Accuracy')
-plt.title('Accuracy over Rounds')
-plt.grid(True)
-plt.legend()
-
-# Plotting loss
-plt.subplot(1, 2, 2)
-plt.plot(rounds, losses, marker='x', color='r', label='Loss')
-plt.xlabel('Rounds')
-plt.ylabel('Loss')
-plt.title('Loss over Rounds')
+plt.title('Accuracy over Rounds for Different Frame Widths')
 plt.grid(True)
 plt.legend()
 
 # Save plot to a PNG file
 plt.tight_layout()
-plt.savefig('federated_learning_results.png', dpi=300)
+plt.savefig('accuracy_comparison.png', dpi=300)
