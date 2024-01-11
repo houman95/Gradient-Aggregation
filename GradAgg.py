@@ -35,7 +35,6 @@ def initialize_global_model(model, model_params):
 
 
 
-
 def load_cifar10_splits(num_splits, root='./data', fraction=1, shuffle=True):
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -51,15 +50,21 @@ def load_cifar10_splits(num_splits, root='./data', fraction=1, shuffle=True):
     train_dataset = torchvision.datasets.CIFAR10(root, train=True, download=True, transform=transform_train)
     test_dataset = torchvision.datasets.CIFAR10(root, train=False, download=True, transform=transform_test)
 
-    # Shuffle the training dataset
-    indices = torch.randperm(len(train_dataset)).tolist() if shuffle else list(range(len(train_dataset)))
-    split_size = int(fraction * len(indices) / num_splits)
+    if shuffle:
+        train_indices = torch.randperm(len(train_dataset)).tolist()
+    else:
+        train_indices = list(range(len(train_dataset)))
+
+    split_size = int(fraction * len(train_dataset) / num_splits)
     train_splits = []
     for i in range(num_splits):
-        split_indices = indices[i * split_size:(i + 1) * split_size]
-        train_splits.append(Subset(train_dataset, split_indices))
+        start_idx = i * split_size
+        end_idx = min((i + 1) * split_size, len(train_indices))
+        subset_indices = train_indices[start_idx:end_idx]
+        train_splits.append(Subset(train_dataset, subset_indices))
 
     return train_splits, test_dataset
+
 
 # Server Class
 class Server:
@@ -120,7 +125,7 @@ class Server:
             all_rounds_info['global_losses'].append(global_loss)
             #all_rounds_info['global_model_states'].append(copy.deepcopy(self.global_model.state_dict()))
             if round>0:
-                train_splits, _ = load_cifar10_splits(len(self.clients))
+                train_splits, _ = load_cifar10_splits(len(self.clients), )
                 for i, client in enumerate(self.clients):
                         client.train_data = train_splits[i]
                         if i == 0:
