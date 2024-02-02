@@ -1,0 +1,123 @@
+import logging
+
+# Set up logging configuration
+logging.basicConfig(filename='simplifiedFL.log', level=logging.INFO, format='%(message)s')
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Forces TensorFlow to use CPU
+
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras.datasets import cifar10
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import layers, models
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.optimizers import Adam
+
+# Set random seeds for reproducibility
+np.random.seed(5)
+tf.random.set_seed(5)
+
+def train_validation_split(X_train, Y_train):
+    train_length = len(X_train)
+    validation_length = int(train_length / 4)
+    X_validation = X_train[:validation_length]
+    X_train = X_train[validation_length:]
+    Y_validation = Y_train[:validation_length]
+    Y_train = Y_train[validation_length:]
+    return X_train, Y_train, X_validation, Y_validation
+
+# Network settings
+learning_rate = 0.01
+epochs = 3
+batch = 32
+iterations = 10
+number_of_users = 2
+
+# Load and preprocess CIFAR-10 dataset
+(X_train, Y_train), (X_test, Y_test) = cifar10.load_data()
+X_train, X_test = X_train / 255.0, X_test / 255.0
+Y_train, Y_test = to_categorical(Y_train), to_categorical(Y_test)
+
+# Initialize train_data_X and train_data_Y with the correct dimensions
+train_data_X = np.zeros((number_of_users,) + X_train.shape)
+train_data_Y = np.zeros((number_of_users,) + Y_train.shape)
+
+
+# Model definition
+initializer = tf.keras.initializers.HeUniform(seed=5)
+model = models.Sequential([
+    # Add layers as per the provided structure
+  layers.Conv2D(32, (3, 3), activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(seed=5), padding='same', input_shape=(32, 32, 3)),
+  layers.BatchNormalization(),
+  layers.Conv2D(32, (3, 3), activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(seed=5), padding='same'),
+  layers.BatchNormalization(),
+  layers.MaxPooling2D((2, 2)),
+  layers.Dropout(0.2),
+  layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(seed=5), padding='same'),
+  layers.BatchNormalization(),
+  layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(seed=5), padding='same'),
+  layers.BatchNormalization(),
+  layers.MaxPooling2D((2, 2)),
+  layers.Dropout(0.3),
+  layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(seed=5), padding='same'),
+  layers.BatchNormalization(),
+  layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(seed=5), padding='same'),
+  layers.BatchNormalization(),
+  layers.MaxPooling2D((2, 2)),
+  layers.Dropout(0.4),
+  layers.Flatten(),
+  layers.Dense(128, activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(seed=5)),
+  layers.BatchNormalization(),
+  layers.Dropout(0.5),
+  layers.Dense(10, activation='softmax'),
+])
+
+model_name = model._name
+opt = Adam(learning_rate=0.0001) if model_name not in ['VGG16', 'resnet18'] else Adam()
+model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Federated Learning Process
+wc = model.get_weights()  # Initial global model weights
+logging.info(f"\n Simulating with number_of_users: {number_of_users}")
+for iter in range(iterations):
+    gradients = []
+    total_data_points = 0
+
+    for i in range(number_of_users):
+        X_train_u = X_train
+        Y_train_u = Y_train
+        # Shuffle the data
+        np.random.seed(5)
+        shuffler = np.random.permutation(len(X_train_u))
+        X_train_u = X_train_u[shuffler]
+        Y_train_u = Y_train_u[shuffler]
+        # Split the data into training and validation sets
+        X_train_u, Y_train_u, X_val_u, Y_val_u = train_validation_split(X_train_u, Y_train_u)
+
+        # Train model for each user
+        model.set_weights(wc)
+        model.fit(X_train_u, Y_train_u, epochs=epochs, batch_size=batch, validation_data=(X_val_u, Y_val_u), shuffle=False)
+
+        # Gradient calculation
+        wu = model.get_weights()
+        nu = len(X_train_u) + len(X_val_u)
+        total_data_points += nu
+        gradient = [np.subtract(wu[i], wc[i]) for i in range(len(wu))]
+        #weighted_gradient = [g * nu for g in gradient]
+        gradients.append(gradient)
+
+    # Aggregate gradients
+    new_weights = [np.sum([gradients[user][i] for user in range(number_of_users)], axis=0) / number_of_users for i in range(len(wc))]
+    wc = [wc[i] + new_weights[i] for i in range(len(wc))]
+
+    # Update global model
+    model.set_weights(wc)
+
+    # Evaluate global model
+    _, accuracy = model.evaluate(X_test, Y_test)
+    tf.keras.backend.clear_session()
+    logging.info(f"Iteration {iter + 1}, Accuracy: {accuracy:.4f}")
+
+# Save final model
+model.save("federated_model2users.h5")
+
