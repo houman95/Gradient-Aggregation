@@ -1,23 +1,11 @@
-# Set up logging configuration
 import logging
+
+# Set up logging configuration
 logging.basicConfig(filename='simplifiedFL.log', level=logging.INFO, format='%(message)s')
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Forces TensorFlow to use CPU
+
 import tensorflow as tf
-
-# Check if TensorFlow is able to detect the GPU
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        # Currently, memory growth needs to be the same across GPUs
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-    except RuntimeError as e:
-        # Memory growth must be set before GPUs have been initialized
-        print(e)
-else:
-    print("No GPU detected. Running on CPU.")
-
 import numpy as np
 from tensorflow.keras.datasets import cifar10
 from tensorflow.keras.utils import to_categorical
@@ -40,25 +28,19 @@ def train_validation_split(X_train, Y_train):
 
 # Network settings
 learning_rate = 0.01
-epochs = 1
+epochs = 3
 batch = 32
 iterations = 10
-number_of_users = 20
+number_of_users = 2
 
 # Load and preprocess CIFAR-10 dataset
 (X_train, Y_train), (X_test, Y_test) = cifar10.load_data()
 X_train, X_test = X_train / 255.0, X_test / 255.0
 Y_train, Y_test = to_categorical(Y_train), to_categorical(Y_test)
 
-# FL setting
-size_of_user_ds = int(len(X_train)/number_of_users)
-train_data_X = np.zeros((number_of_users,size_of_user_ds, 32, 32, 3))
-train_data_Y = np.ones((number_of_users,size_of_user_ds,10))
-
-for i in range(number_of_users):
-    train_data_X[i] = X_train[size_of_user_ds*i:size_of_user_ds*i+size_of_user_ds]
-    train_data_Y[i] = Y_train[size_of_user_ds*i:size_of_user_ds*i+size_of_user_ds]
-
+# Initialize train_data_X and train_data_Y with the correct dimensions
+train_data_X = np.zeros((number_of_users,) + X_train.shape)
+train_data_Y = np.zeros((number_of_users,) + Y_train.shape)
 
 
 # Model definition
@@ -102,9 +84,8 @@ for iter in range(iterations):
     total_data_points = 0
 
     for i in range(number_of_users):
-        X_train_u = train_data_X[i]
-        Y_train_u = train_data_Y[i]
-
+        X_train_u = X_train
+        Y_train_u = Y_train
         # Shuffle the data
         np.random.seed(5)
         shuffler = np.random.permutation(len(X_train_u))
@@ -121,12 +102,12 @@ for iter in range(iterations):
         wu = model.get_weights()
         nu = len(X_train_u) + len(X_val_u)
         total_data_points += nu
-        gradient = [wu[j] - wc[j] for j in range(len(wc))]
-        weighted_gradient = [g * nu for g in gradient]
-        gradients.append(weighted_gradient)
+        gradient = [np.subtract(wu[i], wc[i]) for i in range(len(wu))]
+        #weighted_gradient = [g * nu for g in gradient]
+        gradients.append(gradient)
 
     # Aggregate gradients
-    new_weights = [np.sum([gradients[user][i] for user in range(number_of_users)], axis=0) / total_data_points for i in range(len(wc))]
+    new_weights = [np.sum([gradients[user][i] for user in range(number_of_users)], axis=0) / number_of_users for i in range(len(wc))]
     wc = [wc[i] + new_weights[i] for i in range(len(wc))]
 
     # Update global model
@@ -134,8 +115,8 @@ for iter in range(iterations):
 
     # Evaluate global model
     _, accuracy = model.evaluate(X_test, Y_test)
+    tf.keras.backend.clear_session()
     logging.info(f"Iteration {iter + 1}, Accuracy: {accuracy:.4f}")
 
 # Save final model
 model.save("federated_model2users.h5")
-
